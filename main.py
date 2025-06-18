@@ -8,6 +8,7 @@ from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 from typing import List
 import random
+from scipy.stats import kendalltau
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -138,6 +139,30 @@ def compute_accuracy(predicted_folder: str, ground_truth_folder: str):
     acc = np.mean(scores) * 100
     print(f"✅ SSIM-based Accuracy (1.jpg, 2.jpg naming): {acc:.2f}%")
 
+def compute_order_accuracy(predicted_folder: str, ground_truth_folder: str):
+    # Load predicted filenames: ['000_22000.jpg', ...]
+    pred_files = sorted([f for f in os.listdir(predicted_folder) if f.endswith(".jpg")])
+
+    # Ground truth files sorted numerically: ['1.jpg', '2.jpg', ..., '99.jpg']
+    gt_files = sorted([f for f in os.listdir(ground_truth_folder) if f.endswith(".jpg")],
+                      key=lambda x: int(x.split('.')[0]))
+    
+    # Map ground truth filename (e.g., '22000.jpg') to its true position
+    gt_index_map = {fname: idx for idx, fname in enumerate(gt_files)}
+
+    pred_indices = []
+    for fname in pred_files:
+        try:
+            # Extract original shuffled name: '000_22000.jpg' → '22000.jpg'
+            orig_name = fname.split('_')[1]
+            if orig_name in gt_index_map:
+                pred_indices.append(gt_index_map[orig_name])
+            else:
+                print(f"⚠️ Original filename '{orig_name}' not found in ground truth folder.")
+                return
+        except (IndexError, ValueError):
+            print(f"⚠️ Failed to extract index from '{fname}'")
+            return
 
 # === Main Pipeline ===
 if __name__ == "__main__":
@@ -161,3 +186,7 @@ if __name__ == "__main__":
     compute_accuracy(output_folder, ground_truth_folder)
 
 
+# Calculate Kendall's Tau
+    tau, _ = kendalltau(output_folder, ground_truth_folder)
+    acc = (tau + 1) / 2 * 100  # Normalize tau from [-1,1] to [0,100]
+    print(f"✅ Order-based Accuracy (Kendall's Tau): {acc:.2f}%")
