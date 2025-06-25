@@ -8,13 +8,14 @@ from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 from typing import List
 import random
-from scipy.stats import kendalltau
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load pre-trained ResNet18 (feature extractor)
-model = models.resnet18(pretrained=True)
-model = torch.nn.Sequential(*list(model.children())[:-1])  # remove FC
+# Loading pre-trained DenseNet121 for feature extraction
+from torchvision.models import densenet121, DenseNet121_Weights
+backbone = densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1).features
+gap = torch.nn.AdaptiveAvgPool2d((1, 1))  # Global Avg Pool
+model = torch.nn.Sequential(backbone, gap)
 model.eval().to(device)
 
 # Preprocessing
@@ -48,57 +49,68 @@ def extract_features(images: List[np.ndarray]):
     return np.array(features)
 
 # === Compute pairwise cosine distances ===
-def compute_distances(features: np.ndarray):
-    return cdist(features, features, metric="cosine")
+def compute_hybrid_distances(features, images, top_k=30):
+    cosine_dist = cdist(features, features, metric="cosine")
+    n = len(images)
+    
+    # Pre-convert to grayscale
+    gray_images = [cv2.resize(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY), (112, 112)) 
+                   for img in images]
+    
+    # Compute SSIM for ALL pairs, but prioritize closest ones
+    ssim_dist = np.ones((n, n))  # Initialize with max distance
+    
+    # Compute SSIM for top-k pairs per frame
+    computed_pairs = set()
+    for i in tqdm(range(n), desc="Computing SSIM"):
+        closest_indices = np.argsort(cosine_dist[i])[:top_k+1]
+        for j in closest_indices:
+            if i != j and (i,j) not in computed_pairs and (j,i) not in computed_pairs:
+                ssim_val = ssim(gray_images[i], gray_images[j])
+                ssim_dist[i,j] = ssim_dist[j,i] = 1 - ssim_val
+                computed_pairs.add((i,j))
+    
+    # For uncomputed pairs, use cosine distance
+    for i in range(n):
+        for j in range(n):
+            if ssim_dist[i,j] == 1.0 and i != j:  # Not computed
+                ssim_dist[i,j] = cosine_dist[i,j]
+    
+    # Weighted combination
+    alpha = 0.7
+    return alpha * cosine_dist + (1-alpha) * ssim_dist
 
+
+
+#legacy method
 # # === Greedy TSP-based global sorting ===
 # def global_sort(dist_matrix: np.ndarray):
-    n = dist_matrix.shape[0]
-    visited = [0]
-    for _ in range(n - 1):
-        last = visited[-1]
-        dists = dist_matrix[last]
-        dists[visited] = np.inf
-        next_node = np.argmin(dists)
-        visited.append(next_node)
-    return visited
+#     n = dist_matrix.shape[0]
+#     visited = [0]
+#     for _ in range(n - 1):
+#         last = visited[-1]
+#         dists = dist_matrix[last]
+#         dists[visited] = np.inf
+#         next_node = np.argmin(dists)
+#         visited.append(next_node)
+#     return visited
 
-import random
+
 
 # === Random Seed Sort: builds sequence linearly from a random start
-def random_seed_sort(dist_matrix: np.ndarray):
+def random_seed_sort(dist_matrix: np.ndarray, start_idx: int):
     n = dist_matrix.shape[0]
     unvisited = set(range(n))
-    seed = random.choice(list(unvisited))
-    
-    order = [seed]
-    unvisited.remove(seed)
-
+    order = [start_idx]
+    unvisited.remove(start_idx)
     while unvisited:
         last = order[-1]
         dists = dist_matrix[last]
-        
-        # Mask already visited
         dists = [(i, dists[i]) for i in unvisited]
         next_node = min(dists, key=lambda x: x[1])[0]
-
         order.append(next_node)
         unvisited.remove(next_node)
-    
     return order
-
-
-def best_of_n_random_seeds(dist_matrix, n_trials=10):
-    best_order = None
-    best_cost = float('inf')
-    
-    for _ in range(n_trials):
-        order = random_seed_sort(dist_matrix)
-        cost = sum(dist_matrix[order[i], order[i+1]] for i in range(len(order)-1))
-        if cost < best_cost:
-            best_cost = cost
-            best_order = order
-    return best_order
 
 
 
@@ -108,12 +120,16 @@ def save_ordered(images, order, filenames, output_folder="ordered_frames"):
     for idx, i in enumerate(order):
         out_path = os.path.join(output_folder, f"{idx:03d}_{filenames[i]}")
         cv2.imwrite(out_path, cv2.cvtColor(images[i], cv2.COLOR_RGB2BGR))
-    print(f"✅ Saved ordered frames to '{output_folder}'")
+    print(f" Saved ordered frames to '{output_folder}'")
 
-# === Updated Accuracy Check (for '1.jpg', '2.jpg'... filenames) ===
 def compute_accuracy(predicted_folder: str, ground_truth_folder: str):
     pred_files = sorted([f for f in os.listdir(predicted_folder) if f.endswith(".jpg")])
     gt_files = sorted(os.listdir(ground_truth_folder), key=lambda x: int(x.split('.')[0]))
+    
+    # DEBUG: Print first few file pairs
+    print("DEBUG - First 5 file pairs:")
+    for i in range(min(5, len(pred_files))):
+        print(f"  Predicted: {pred_files[i]} vs Ground Truth: {gt_files[i]}")
 
     if len(pred_files) != len(gt_files):
         print(f"⚠️ Mismatch in frame counts: predicted = {len(pred_files)}, ground truth = {len(gt_files)}")
@@ -139,30 +155,6 @@ def compute_accuracy(predicted_folder: str, ground_truth_folder: str):
     acc = np.mean(scores) * 100
     print(f"✅ SSIM-based Accuracy (1.jpg, 2.jpg naming): {acc:.2f}%")
 
-def compute_order_accuracy(predicted_folder: str, ground_truth_folder: str):
-    # Load predicted filenames: ['000_22000.jpg', ...]
-    pred_files = sorted([f for f in os.listdir(predicted_folder) if f.endswith(".jpg")])
-
-    # Ground truth files sorted numerically: ['1.jpg', '2.jpg', ..., '99.jpg']
-    gt_files = sorted([f for f in os.listdir(ground_truth_folder) if f.endswith(".jpg")],
-                      key=lambda x: int(x.split('.')[0]))
-    
-    # Map ground truth filename (e.g., '22000.jpg') to its true position
-    gt_index_map = {fname: idx for idx, fname in enumerate(gt_files)}
-
-    pred_indices = []
-    for fname in pred_files:
-        try:
-            # Extract original shuffled name: '000_22000.jpg' → '22000.jpg'
-            orig_name = fname.split('_')[1]
-            if orig_name in gt_index_map:
-                pred_indices.append(gt_index_map[orig_name])
-            else:
-                print(f"⚠️ Original filename '{orig_name}' not found in ground truth folder.")
-                return
-        except (IndexError, ValueError):
-            print(f"⚠️ Failed to extract index from '{fname}'")
-            return
 
 # === Main Pipeline ===
 if __name__ == "__main__":
@@ -175,18 +167,13 @@ if __name__ == "__main__":
     features = extract_features(images)
 
     # Step 2: Pairwise distances + sorting
-    dist_matrix = compute_distances(features)
-    order = best_of_n_random_seeds(dist_matrix)
+    dist_matrix = compute_hybrid_distances(features,images)
+    start_filename = "4096000.jpg"
+    start_idx = filenames.index(start_filename)
+    order = random_seed_sort(dist_matrix, start_idx)
 
 
-    # Step 3: Save ordered frames
+
     save_ordered(images, order, filenames, output_folder)
 
-    # Step 4: Accuracy evaluation
     compute_accuracy(output_folder, ground_truth_folder)
-
-
-# Calculate Kendall's Tau
-    tau, _ = kendalltau(output_folder, ground_truth_folder)
-    acc = (tau + 1) / 2 * 100  # Normalize tau from [-1,1] to [0,100]
-    print(f"✅ Order-based Accuracy (Kendall's Tau): {acc:.2f}%")
