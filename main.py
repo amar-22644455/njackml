@@ -122,44 +122,11 @@ def save_ordered(images, order, filenames, output_folder="ordered_frames"):
         cv2.imwrite(out_path, cv2.cvtColor(images[i], cv2.COLOR_RGB2BGR))
     print(f" Saved ordered frames to '{output_folder}'")
 
-def compute_accuracy(predicted_folder: str, ground_truth_folder: str):
-    pred_files = sorted([f for f in os.listdir(predicted_folder) if f.endswith(".jpg")])
-    gt_files = sorted(os.listdir(ground_truth_folder), key=lambda x: int(x.split('.')[0]))
-    
-    # DEBUG: Print first few file pairs
-    print("DEBUG - First 5 file pairs:")
-    for i in range(min(5, len(pred_files))):
-        print(f"  Predicted: {pred_files[i]} vs Ground Truth: {gt_files[i]}")
-
-    if len(pred_files) != len(gt_files):
-        print(f"⚠️ Mismatch in frame counts: predicted = {len(pred_files)}, ground truth = {len(gt_files)}")
-        return
-
-    scores = []
-    for p, g in tqdm(zip(pred_files, gt_files), total=len(pred_files), desc="Comparing frames"):
-        pred_path = os.path.join(predicted_folder, p)
-        gt_path = os.path.join(ground_truth_folder, g)
-
-        pred_img = cv2.imread(pred_path)
-        gt_img = cv2.imread(gt_path)
-
-        if pred_img is None or gt_img is None:
-            continue
-
-        pred_gray = cv2.resize(cv2.cvtColor(pred_img, cv2.COLOR_BGR2GRAY), (224, 224))
-        gt_gray = cv2.resize(cv2.cvtColor(gt_img, cv2.COLOR_BGR2GRAY), (224, 224))
-
-        sim = ssim(pred_gray, gt_gray)
-        scores.append(sim)
-
-    acc = np.mean(scores) * 100
-    print(f"✅ SSIM-based Accuracy (1.jpg, 2.jpg naming): {acc:.2f}%")
 
 
 # === Main Pipeline ===
 if __name__ == "__main__":
     shuffled_folder = "shuffled_frames"
-    ground_truth_folder = "correct_frames"
     output_folder = "ordered_frames"
 
     # Step 1: Load and extract features
@@ -176,4 +143,3 @@ if __name__ == "__main__":
 
     save_ordered(images, order, filenames, output_folder)
 
-    compute_accuracy(output_folder, ground_truth_folder)
